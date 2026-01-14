@@ -1,20 +1,27 @@
-const express = require("express");
-const axios = require("axios");
-const { z } = require("zod");
-const twilio = require("twilio");
+import express from "express";
+import axios from "axios";
+import twilio from "twilio";
+import { z } from "zod";
 
 const app = express();
+
+// Twilio sends form-encoded by default for voice webhooks
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
 const {
+  TWILIO_AUTH_TOKEN,
   MAKE_GETQUOTE_WEBHOOK_URL,
-  MAKE_CONFIRMBOOKING_WEBHOOK_URL,
+  MAKE_CONFIRMBOOKING_WEBHOOK_URL
 } = process.env;
+
+if (!TWILIO_AUTH_TOKEN) console.warn("Missing TWILIO_AUTH_TOKEN");
+if (!MAKE_GETQUOTE_WEBHOOK_URL) console.warn("Missing MAKE_GETQUOTE_WEBHOOK_URL");
+if (!MAKE_CONFIRMBOOKING_WEBHOOK_URL) console.warn("Missing MAKE_CONFIRMBOOKING_WEBHOOK_URL");
 
 const VoiceResponse = twilio.twiml.VoiceResponse;
 
-// In-memory state keyed by CallSid (OK for MVP)
+// In-memory state keyed by CallSid. Use Redis later if you need persistence across replicas.
 const callState = new Map();
 
 function containsDollar(text = "") {
@@ -22,11 +29,10 @@ function containsDollar(text = "") {
   return t.includes("$") || t.includes("usd") || t.includes("dollar") || t.includes("bucks");
 }
 
-// This protects what SPARK says, not what caller says.
-function enforceGbpSpeech(text) {
-  if (!text) return text;
+function ensureGbpOnly(text) {
+  // This protects what Spark says. It does not block callers from saying “dollars”.
   if (containsDollar(text)) {
-    return "Sorry, that’s in pounds. I will quote in £ only. Is the cleaning for a home or a business premises?";
+    return "Sorry, I only quote in pounds. Is the cleaning for a home or for a business premises?";
   }
   return text;
 }
@@ -36,147 +42,135 @@ function sayGather(twiml, text) {
     input: "speech",
     speechTimeout: "auto",
     action: "/call/input",
-    method: "POST",
+    method: "POST"
   });
-  gather.say({ voice: "alice", language: "en-GB" }, enforceGbpSpeech(text));
+
+  gather.say({ voice: "alice", language: "en-GB" }, ensureGbpOnly(text));
   twiml.redirect({ method: "POST" }, "/call/input");
 }
 
-function getState(callSid) {
-  if (!callState.has(callSid)) {
-    callState.set(callSid, { transcript: [], stage: "start", data: {} });
-  }
-  return callState.get(callSid);
+function validateTwilioSignature(req) {
+  // If you are testing with curl or a browser, signature validation will fail.
+  // In production with Twilio, it should pass.
+  const signature = req.headers["x-twilio-signature"];
+  if (!signature) return false;
+
+  const url = `${req.protocol}://${req.get("host")}${req.originalUrl}`;
+  return twilio.validateRequest(TWILIO_AUTH_TOKEN, signature, url, req.body);
 }
 
-// Minimal phrase helpers
-function includesAny(text, arr) {
-  const t = (text || "").toLowerCase();
-  return arr.some((x) => t.includes(x));
-}
+// Schemas for downstream Make webhooks when you wire them in
+const ExtraSchema = z.object({
+  name: z.string().min(1),
+  quantity: z.number().int().nonnegative()
+});
 
-function detectCategory(text) {
-  const t = (text || "").toLowerCase();
-  const domesticHints = ["home", "house", "flat", "apartment", "studio", "tenancy", "landlord", "move out", "move-out"];
-  const commercialHints = ["office", "shop", "warehouse", "school", "clinic", "gym", "venue", "site", "business", "restaurant", "workplace"];
+const GetQuoteSchema = z.object({
+  intent: z.literal("get_quote"),
+  service_category: z.enum(["domestic", "commercial"]),
+  domestic_service_type: z.string(),
+  commercial_service_type: z.string(),
+  domestic_property_type: z.string(),
+  commercial_property_type: z.string(),
+  job_type: z.string(),
+  bedrooms: z.number().int().nonnegative(),
+  bathrooms: z.number().int().nonnegative(),
+  toilets: z.number().int().nonnegative(),
+  kitchens: z.number().int().nonnegative(),
+  postcode: z.string().min(1),
+  preferred_hours: z.number().nonnegative(),
+  visit_frequency_per_week: z.number().nonnegative(),
+  areas_scope: z.string(),
+  extras: z.array(ExtraSchema),
+  notes: z.string()
+});
 
-  const d = domesticHints.some((x) => t.includes(x));
-  const c = commercialHints.some((x) => t.includes(x));
+const ConfirmBookingSchema = z.object({
+  intent: z.literal("confirm_booking"),
+  full_name: z.string().min(1),
+  phone: z.string().min(1),
+  email: z.string().min(1),
+  address: z.string().min(1),
+  postcode: z.string().min(1),
+  preferred_date: z.string().min(1),
+  preferred_time: z.string().min(1)
+});
 
-  if (d && !c) return "domestic";
-  if (c && !d) return "commercial";
-  return "";
-}
+app.get("/health", (req, res) => res.json({ ok: true }));
 
-// Step: start call
 app.post("/call/start", (req, res) => {
-  const callSid = req.body.CallSid;
-  callState.set(callSid, { transcript: [], stage: "need_category", data: {} });
+  // Optional: enforce Twilio signature in production
+  // if (!validateTwilioSignature(req)) return res.status(403).send("Forbidden");
+
+  const callSid = req.body.CallSid || `local_${Date.now()}`;
+
+  callState.set(callSid, {
+    stage: "start",
+    transcript: [],
+    data: {}
+  });
 
   const twiml = new VoiceResponse();
-  sayGather(twiml, "Hi, you’re through to TotalSpark Solutions. Is the cleaning for a home or for a business premises?");
+  sayGather(
+    twiml,
+    "Hi, you’re through to TotalSpark Solutions. Is the cleaning for a home or for a business premises?"
+  );
   res.type("text/xml").send(twiml.toString());
 });
 
-// Input handler with stage machine
 app.post("/call/input", async (req, res) => {
-  const callSid = req.body.CallSid;
-  const speech = (req.body.SpeechResult || "").trim();
-  const state = getState(callSid);
+  // Optional: enforce Twilio signature in production
+  // if (!validateTwilioSignature(req)) return res.status(403).send("Forbidden");
+
+  const callSid = req.body.CallSid || `local_${Date.now()}`;
+  const speech = String(req.body.SpeechResult || "").trim();
+  const state = callState.get(callSid) || { stage: "start", transcript: [], data: {} };
 
   if (speech) state.transcript.push(speech);
+  callState.set(callSid, state);
 
   const twiml = new VoiceResponse();
 
   if (!speech) {
-    sayGather(twiml, "Sorry, I didn’t catch that. Is the cleaning for a home or for a business premises?");
+    sayGather(twiml, "Sorry, I didn’t catch that. Is this for a home or a business premises?");
     return res.type("text/xml").send(twiml.toString());
   }
 
-  // Never refuse on vague input. Always clarify first.
-  // Only refuse after caller confirms non-cleaning.
-  // This MVP does not implement the refusal branch yet.
+  const lower = speech.toLowerCase();
 
-  // Stage 1: Category
-  if (state.stage === "need_category") {
-    let category = detectCategory(speech);
+  // Category detection with a clarity-first approach
+  const domesticHints = ["home", "house", "flat", "apartment", "studio", "tenancy", "move out", "landlord"];
+  const commercialHints = ["office", "shop", "warehouse", "school", "clinic", "gym", "venue", "site", "business", "restaurant", "workplace"];
 
-    if (!category) {
-      // Allow direct answers like "domestic" / "commercial"
-      const t = speech.toLowerCase();
-      if (t.includes("home") || t.includes("domestic")) category = "domestic";
-      if (t.includes("business") || t.includes("commercial")) category = "commercial";
-    }
+  const mentionedDomestic = domesticHints.some((x) => lower.includes(x));
+  const mentionedCommercial = commercialHints.some((x) => lower.includes(x));
 
-    if (!category) {
-      sayGather(twiml, "Thanks. Is it for a home, like a flat or house, or for a business, like an office or shop?");
-      return res.type("text/xml").send(twiml.toString());
-    }
+  if (!state.data.service_category) {
+    if (mentionedDomestic && !mentionedCommercial) state.data.service_category = "domestic";
+    if (mentionedCommercial && !mentionedDomestic) state.data.service_category = "commercial";
+  }
 
-    state.data.service_category = category;
-    state.stage = "need_service_type";
+  if (!state.data.service_category) {
+    // Ask for clarity instead of refusing
+    sayGather(twiml, "Thanks. Is the cleaning for a home or for a business premises?");
+    return res.type("text/xml").send(twiml.toString());
+  }
 
-    if (category === "commercial") {
-      sayGather(twiml, "Thanks. What type of commercial cleaning do you need? For example regular commercial cleaning, deep clean, post-construction, or disinfection.");
+  if (!state.data.service_type) {
+    if (state.data.service_category === "domestic") {
+      sayGather(twiml, "What type of domestic cleaning do you need. End of tenancy, deep clean, regular cleaning, post-construction, or disinfection?");
     } else {
-      sayGather(twiml, "Thanks. What type of domestic cleaning do you need? For example end of tenancy, deep clean, regular cleaning, post-construction, or disinfection.");
+      sayGather(twiml, "What type of commercial cleaning do you need. Regular commercial cleaning, deep clean, post-construction, or disinfection?");
     }
-
     return res.type("text/xml").send(twiml.toString());
   }
 
-  // Stage 2: Service type
-  if (state.stage === "need_service_type") {
-    state.data.service_type_raw = speech;
-
-    // Store into correct field placeholders (you will tighten this later)
-    if (state.data.service_category === "commercial") {
-      state.data.commercial_service_type = speech;
-      state.data.domestic_service_type = "";
-      state.stage = "need_job_type";
-      sayGather(twiml, "Is this a one-time clean or an ongoing service?");
-      return res.type("text/xml").send(twiml.toString());
-    } else {
-      state.data.domestic_service_type = speech;
-      state.data.commercial_service_type = "";
-      state.stage = "need_property_and_postcode";
-      sayGather(twiml, "Thanks. What’s the property type and postcode?");
-      return res.type("text/xml").send(twiml.toString());
-    }
-  }
-
-  // Stage 3: Job type for commercial (mandatory)
-  if (state.stage === "need_job_type") {
-    const t = speech.toLowerCase();
-    if (t.includes("one") || t.includes("once") || t.includes("one-off") || t.includes("one off")) state.data.job_type = "one_time";
-    if (t.includes("ongoing") || t.includes("regular") || t.includes("weekly") || t.includes("monthly") || t.includes("recurring")) state.data.job_type = "regular";
-
-    if (!state.data.job_type) {
-      sayGather(twiml, "Just to confirm, is it a one-time clean, or ongoing regular visits?");
-      return res.type("text/xml").send(twiml.toString());
-    }
-
-    state.stage = "need_property_and_postcode";
-    sayGather(twiml, "Thanks. What’s the property type and postcode?");
-    return res.type("text/xml").send(twiml.toString());
-  }
-
-  // Stage 4: Property + postcode (MVP parsing, you will tighten later)
-  if (state.stage === "need_property_and_postcode") {
-    state.data.property_and_postcode_raw = speech;
-    state.stage = "next";
-
-    sayGather(twiml, "Thanks. Next I will ask about rooms and any extras. For now, tell me the number of bedrooms and bathrooms.");
-    return res.type("text/xml").send(twiml.toString());
-  }
-
-  // Default
-  sayGather(twiml, "Thanks. I will ask the next detail. What’s the postcode?");
+  // Placeholder next step
+  sayGather(twiml, "Thanks. What is the property type and the postcode?");
   return res.type("text/xml").send(twiml.toString());
 });
 
-// Health check
-app.get("/health", (req, res) => res.json({ ok: true }));
+// Railway binds PORT automatically
+const port = Number(process.env.PORT || 3000);
+app.listen(port, () => console.log(`Server listening on ${port}`));
 
-const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`Spark brain listening on ${port}`));
