@@ -1,15 +1,16 @@
 {
-  "name": "totalspark-brain-api",
+  "name": "spark-ai-agent",
   "version": "1.0.0",
-  "main": "server.js",
-  "type": "module",
+  "private": true,
+  "main": "src/server.js",
+  "type": "commonjs",
   "scripts": {
-    "start": "node server.js"
+    "start": "node src/server.js"
   },
   "dependencies": {
-    "axios": "^1.7.7",
+    "axios": "^1.6.8",
     "express": "^4.19.2",
-    "twilio": "^5.3.2",
+    "twilio": "^5.3.0",
     "zod": "^3.23.8"
   }
 }
